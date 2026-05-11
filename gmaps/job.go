@@ -5,12 +5,14 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
 	"github.com/google/uuid"
 	"github.com/gosom/scrapemate"
+	"github.com/playwright-community/playwright-go"
 
 	"github.com/gosom/google-maps-scraper/deduper"
 	"github.com/gosom/google-maps-scraper/exiter"
@@ -21,9 +23,10 @@ type GmapJobOptions func(*GmapJob)
 type GmapJob struct {
 	scrapemate.Job
 
-	MaxDepth     int
-	LangCode     string
-	ExtractEmail bool
+	MaxDepth       int
+	LangCode       string
+	ExtractEmail   bool
+	GeoCoordinates string
 
 	Deduper                 deduper.Deduper
 	ExitMonitor             exiter.Exiter
@@ -67,9 +70,10 @@ func NewGmapJob(
 			MaxRetries: maxRetries,
 			Priority:   prio,
 		},
-		MaxDepth:     maxDepth,
-		LangCode:     langCode,
-		ExtractEmail: extractEmail,
+		MaxDepth:       maxDepth,
+		LangCode:       langCode,
+		ExtractEmail:   extractEmail,
+		GeoCoordinates: strings.ReplaceAll(geoCoordinates, " ", ""),
 	}
 
 	for _, opt := range opts {
@@ -185,6 +189,12 @@ func (j *GmapJob) Process(ctx context.Context, resp *scrapemate.Response) (any, 
 func (j *GmapJob) BrowserActions(ctx context.Context, page scrapemate.BrowserPage) scrapemate.Response {
 	var resp scrapemate.Response
 
+	if err := configureGoogleMapsGeolocation(page, j.GeoCoordinates); err != nil {
+		resp.Error = err
+
+		return resp
+	}
+
 	pageResponse, err := page.Goto(j.GetFullURL(), scrapemate.WaitUntilDOMContentLoaded)
 	if err != nil {
 		resp.Error = err
@@ -254,6 +264,58 @@ func (j *GmapJob) BrowserActions(ctx context.Context, page scrapemate.BrowserPag
 	resp.Body = []byte(body)
 
 	return resp
+}
+
+func configureGoogleMapsGeolocation(page scrapemate.BrowserPage, geoCoordinates string) error {
+	if geoCoordinates == "" {
+		return nil
+	}
+
+	rawPage, ok := page.Unwrap().(playwright.Page)
+	if !ok {
+		return nil
+	}
+
+	latitude, longitude, err := parseGeoCoordinates(geoCoordinates)
+	if err != nil {
+		return err
+	}
+
+	if err := rawPage.Context().SetGeolocation(&playwright.Geolocation{
+		Latitude:  latitude,
+		Longitude: longitude,
+	}); err != nil {
+		return fmt.Errorf("set browser geolocation: %w", err)
+	}
+
+	origin := "https://www.google.com"
+	if err := rawPage.Context().GrantPermissions(
+		[]string{"geolocation"},
+		playwright.BrowserContextGrantPermissionsOptions{Origin: &origin},
+	); err != nil {
+		return fmt.Errorf("grant google maps geolocation permission: %w", err)
+	}
+
+	return nil
+}
+
+func parseGeoCoordinates(geoCoordinates string) (float64, float64, error) {
+	parts := strings.Split(geoCoordinates, ",")
+	if len(parts) != 2 {
+		return 0, 0, fmt.Errorf("invalid geo coordinates: %s", geoCoordinates)
+	}
+
+	latitude, err := strconv.ParseFloat(strings.TrimSpace(parts[0]), 64)
+	if err != nil {
+		return 0, 0, fmt.Errorf("invalid latitude: %w", err)
+	}
+
+	longitude, err := strconv.ParseFloat(strings.TrimSpace(parts[1]), 64)
+	if err != nil {
+		return 0, 0, fmt.Errorf("invalid longitude: %w", err)
+	}
+
+	return latitude, longitude, nil
 }
 
 func waitUntilURLContains(ctx context.Context, page scrapemate.BrowserPage, s string) bool {
